@@ -12,12 +12,16 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/siderolabs/omni/client/pkg/infra/provision"
 	"github.com/siderolabs/omni/client/pkg/omni/resources/infra"
 	"github.com/siderolabs/talos/pkg/machinery/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/stdpatches"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/security"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
@@ -126,6 +130,95 @@ func resizeDisk(ctx context.Context, vm *object.VirtualMachine, diskSizeGiB uint
 	return nil
 }
 
+// normalizePEMCert ensures a PEM certificate string uses proper newlines and
+// 64-character base64 line wrapping. The Omni UI may deliver the cert as a
+// single line with spaces in place of newlines; this function reconstructs
+// the correct PEM block(s) in that case.
+func normalizePEMCert(cert string) string {
+	// Normalize CRLF and trim surrounding whitespace.
+	cert = strings.ReplaceAll(cert, "\r\n", "\n")
+	cert = strings.TrimSpace(cert)
+
+	// Already has newlines – just ensure a single trailing newline.
+	if strings.Contains(cert, "\n") {
+		return strings.TrimRight(cert, "\n") + "\n"
+	}
+
+	// Single-line cert: spaces replaced newlines (e.g. from the Omni UI textarea).
+	// Reconstruct each PEM block individually.
+	var out strings.Builder
+
+	const (
+		beginPrefix  = "-----BEGIN "
+		endPrefix    = "-----END "
+		markerSuffix = "-----"
+	)
+
+	for len(cert) > 0 {
+		if !strings.HasPrefix(cert, beginPrefix) {
+			break
+		}
+
+		// Locate end of BEGIN line, e.g. "-----BEGIN CERTIFICATE-----".
+		beginRest := cert[len(beginPrefix):]
+		headerTailIdx := strings.Index(beginRest, markerSuffix)
+
+		if headerTailIdx < 0 {
+			break
+		}
+
+		headerEnd := len(beginPrefix) + headerTailIdx + len(markerSuffix)
+		header := cert[:headerEnd]
+		cert = strings.TrimLeft(cert[headerEnd:], " ")
+
+		// Locate start of END line, e.g. "-----END CERTIFICATE-----".
+		endStart := strings.Index(cert, endPrefix)
+		if endStart < 0 {
+			break
+		}
+
+		// Base64 body is everything before the END marker; strip spaces.
+		body := strings.ReplaceAll(cert[:endStart], " ", "")
+
+		// Locate end of END line.
+		endRest := cert[endStart+len(endPrefix):]
+		footerTailIdx := strings.Index(endRest, markerSuffix)
+
+		if footerTailIdx < 0 {
+			break
+		}
+
+		footerEnd := endStart + len(endPrefix) + footerTailIdx + len(markerSuffix)
+		footer := cert[endStart:footerEnd]
+		cert = strings.TrimLeft(cert[footerEnd:], " ")
+
+		out.WriteString(header)
+		out.WriteByte('\n')
+
+		for len(body) > 64 {
+			out.WriteString(body[:64])
+			out.WriteByte('\n')
+
+			body = body[64:]
+		}
+
+		if len(body) > 0 {
+			out.WriteString(body)
+			out.WriteByte('\n')
+		}
+
+		out.WriteString(footer)
+		out.WriteByte('\n')
+	}
+
+	if out.Len() == 0 {
+		// Couldn't parse; return as-is with a trailing newline.
+		return strings.TrimRight(cert, "\n") + "\n"
+	}
+
+	return out.String()
+}
+
 // configureNetwork configures the VM's network adapter to use the specified network.
 func configureNetwork(ctx context.Context, finder *find.Finder, vm *object.VirtualMachine, networkName string) error {
 	if networkName == "" {
@@ -228,6 +321,7 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 					zap.Uint("cpu", data.CPU),
 					zap.Uint("memory", data.Memory),
 					zap.Uint64("disk_size", data.DiskSize),
+					zap.Bool("ca_cert_set", data.CACert != ""),
 				)
 
 				// Set up the finder with datacenter context
@@ -313,7 +407,30 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				if versionContract.MultidocNetworkConfigSupported() {
 					combinedConfig.WriteString("---\n")
 					combinedConfig.Write(hostnameConfig)
+
+					if data.CACert != "" {
+						caConfig := security.NewTrustedRootsConfigV1Alpha1()
+						caConfig.MetaName = "custom-ca"
+						// Normalize line endings and ensure a single trailing newline,
+						// since the cert may come from various sources (UI, YAML, Windows editors).
+						caConfig.Certificates = normalizePEMCert(data.CACert)
+
+						ctr, ctrErr := container.New(caConfig)
+						if ctrErr != nil {
+							return provision.NewRetryErrorf(time.Second*10, "failed to create CA cert config: %w", ctrErr)
+						}
+
+						caConfigBytes, caErr := ctr.EncodeBytes(encoder.WithComments(encoder.CommentsDisabled))
+						if caErr != nil {
+							return provision.NewRetryErrorf(time.Second*10, "failed to encode CA cert config: %w", caErr)
+						}
+
+						combinedConfig.WriteString("---\n")
+						combinedConfig.Write(caConfigBytes)
+					}
 				}
+
+				logger.Info("guestinfo.talos.config content", zap.String("name", vmName), zap.String("content", combinedConfig.String()))
 
 				combinedConfigB64 := base64.StdEncoding.EncodeToString(combinedConfig.Bytes())
 
